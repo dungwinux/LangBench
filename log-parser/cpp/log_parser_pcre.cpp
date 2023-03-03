@@ -11,42 +11,37 @@
 #include <sstream>
 #include <ctime>
 
-#if 1 || defined(LP_REGEX_HYPERSCAN)
+#if defined(LP_REGEX_HYPERSCAN)
 #include <hs/hs.h>
 #include <hs/hs_compile.h>
 
-// One scratch per thread (according to doc), and it should be created before the search/scan
-std::vector<hs_scratch_t*> scratch_cache;
-// Sneaky way to get thread id
-#define Regex(x) RegexHS(x, i)
-
 class RegexHS {
 	hs_database *db;
-	hs_scratch **scratch;
 public:
-	RegexHS(std::string_view pattern, std::size_t thread_id) {
+	RegexHS(std::string_view pattern) {
 		hs_compile_error_t *err = nullptr;
-		hs_compile(pattern.data(), HS_FLAG_SINGLEMATCH, HS_MODE_BLOCK, nullptr, &db, &err);
+		hs_compile(pattern.data(), HS_FLAG_SINGLEMATCH || HS_MODE_SOM_HORIZON_SMALL, HS_MODE_BLOCK, nullptr, &db, &err);
 		if (err != nullptr) {
 			perror(err->message);
 			hs_free_compile_error(err);
 		}
-		scratch = &scratch_cache[thread_id];
-		// Reallocation from old pointer is possible, according to the doc
-		if (hs_alloc_scratch(db, scratch) != HS_SUCCESS) {
-			// This is doomed to happen, for now
-			perror("Cannot (re)allocate memory to search");
-		}
 	}
-	bool search(std::string_view str) {
-		return HS_SUCCESS == hs_scan(db, str.data(), str.length(), 0, *scratch, nullptr, nullptr);
+	hs_database *get_db() {
+		return db;
+	}
+	bool search(std::string_view str, hs_scratch_t *scratch) {
+		return HS_SUCCESS == hs_scan(db, str.data(), str.length(), 0, scratch, nullptr, nullptr);
 	}
 	~RegexHS() {
 		hs_free_database(db);
 	}
 };
+// One scratch per thread (according to doc), and it should be created before the search/scan
+std::vector<hs_scratch_t*> scratch_cache;
 
-#define REGEX_SEARCH(pattern, handle) handle.search(pattern)
+#define Regex(x) RegexHS(x)
+// Sneaky way to get thread id
+#define REGEX_SEARCH(pattern, handle) handle.search(pattern, scratch_cache[worker])
 #endif
 
 long time_diff(struct timespec start, struct timespec end) {
@@ -186,9 +181,6 @@ static void index_worker(LogParser* log_parser, size_t id, size_t start, size_t 
 }
 
 template <typename... Args> void LogParser::do_parallel(size_t threads, void (*fn)(LogParser*, size_t, size_t, size_t, Args...), Args... args) {
-#if defined(LP_REGEX_HYPERSCAN)
-	scratch_cache.assign(threads, nullptr);
-#endif
 	std::vector<std::unique_ptr<std::thread>> pool(threads);
 	size_t n = pool.size() - 1;
 	size_t partition = this->files.size() / pool.size();
@@ -200,13 +192,6 @@ template <typename... Args> void LogParser::do_parallel(size_t threads, void (*f
 	for (size_t i = 0; i < pool.size(); i++) {
 		pool[i]->join();
 	}
-#if defined(LP_REGEX_HYPERSCAN)
-	// Freeing data (perhaps) properly
-	for (auto &&scratch: scratch_cache) {
-		hs_free_scratch(scratch);
-	}
-	scratch_cache.clear();
-#endif
 }
 
 void LogParser::index(size_t threads) {
@@ -587,16 +572,39 @@ int main(int argc, char* argv[]) {
 			print_results(results);
 		}
 	} else if (type == "regex") {
+#if defined(LP_REGEX_HYPERSCAN)
+			scratch_cache.assign(num_threads, nullptr);
+#endif
 		for (size_t i = 0; i < searches.size(); i++) {
 			std::string& s = searches[i];
 			printf("[info] regex search %zd: %s\n", i, s.c_str());
 			std::vector<UniquePtr<LogParser::SearchResult>> results;
+#if defined(LP_REGEX_HYPERSCAN)
+			auto sample_db = RegexHS(s);
+			auto current = scratch_cache[0];
+			if (hs_alloc_scratch(sample_db.get_db(), &scratch_cache[0]) != HS_SUCCESS) {
+				perror("Cannot (re)allocate memory to search");
+				break;
+			}
+			// If a new allocation was done, clone the scratch to other threads
+			if (current != scratch_cache[0]) {
+				for (size_t i = 1; i < scratch_cache.size(); ++i) {
+					hs_free_scratch(scratch_cache[i]);
+					hs_clone_scratch(scratch_cache[0], &scratch_cache[i]);
+				}
+			}
+#endif
 			clock_gettime(CLOCK_MONOTONIC, &t0);
 			lp.search_regex<false>(num_threads, s, results);
 			clock_gettime(CLOCK_MONOTONIC, &t1);
 			printf("[info] regex search %zd took: %ld\n", i, time_diff(t0, t1));
 			print_results(results);
 		}
+#if defined(LP_REGEX_HYPERSCAN)
+		for (auto &&scratch: scratch_cache) {
+			hs_free_scratch(scratch);
+		}
+#endif
 	} else if (type == "spooky") {
 		std::vector<UniquePtr<LogParser::SearchResult>> results;
 		clock_gettime(CLOCK_MONOTONIC, &t0);
