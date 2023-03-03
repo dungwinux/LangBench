@@ -60,8 +60,9 @@ if (LP_REGEX_HYPERSCAN)
 	FetchContent_MakeAvailable(hs)
 endif()
 
+# Hyperscan integration is experimental, splitting into a different file for now
 if (LP_REGEX_HYPERSCAN)
-	add_executable(log_parser log_parser_pcre.cpp)
+	add_executable(log_parser log_parser_hs.cpp)
 else()
 	add_executable(log_parser log_parser.cpp)
 endif()
